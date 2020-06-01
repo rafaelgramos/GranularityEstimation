@@ -1,32 +1,34 @@
 require(spatstat)
+require(raster)
 
 robust.quadcount<-function(point_set,
                            random_samples=T,
                            nsamples=500,
                            signif=0.99,
                            tradeoff_crit=c("sum","product"),#,"derivative"), #NOT doing derivative right now
-                           uniformity=c("Quadratcount","Nearest-neighbor"),
-                           robustness=c("Poisson","Binomial","Resampling"),
-                           robust_k = -3){
+                           uniformity_method=c("Quadratcount","Nearest-neighbor"),
+                           robustness_method=c("Poisson","Binomial","Resampling"),
+                           robustness_k = -3,
+                           verbose=F){
   
   W = c(min(point_set[,1]),max(point_set[,1]),min(point_set[,2]),max(point_set[,2]))
   
   #HOW is this initialized?
   my_scales = seq(25,1650,25)
   
+  # calculating robustness and uniformity for each granularity in 'my_scales'
   my_spatialstats = get_spatialstats_all(point_set,
                                         my_scales,
                                         my_scales,
                                         random_samples=random_samples,
                                         signif=signif,
-                                        uniformity=uniformity,
-                                        robustness=robustness)
-  if(robust_k >= 0) {
-    print("robust_k parameter must be less than zero. See documentation for details.")
-    return(NULL)
-  }
-  robust = exp(-3*my_spatialstats$covar)
-  unif = 1-my_spatialstats$csr_pass
+                                        uniformity_method=uniformity_method,
+                                        robustness_method=robustness_method,
+                                        robustness_k = robustness_k,
+                                        verbose=verbose)
+  
+  robust = my_spatialstats$robustness
+  unif = my_spatialstats$uniformity
   
   # tradeoff analysis
   
@@ -71,14 +73,38 @@ robust.quadcount<-function(point_set,
   }
   
   map = list()
-  nlon = round((W[2] - W[1])/opt_granularity)
-  nlat = round((W[4] - W[3])/opt_granularity)
+  nlon = floor((W[2] - W[1])/opt_granularity)
+  nlat = floor((W[4] - W[3])/opt_granularity)
   q = quadratcount(as.ppp(point_set,W),nlon,nlat)
   map$counts = raster(matrix(data=q[],nrow=nrow(q),ncol=ncol(q)))
-  map$counts = setExtent(map$counts,ext=extent(W))
-  #map$unif.score = map$counts
+  map$counts = raster::setExtent(map$counts,ext=raster::extent(W))
+  map$opt_granularity = opt_granularity
+
+  final_sample = create_samples(point_set=point_set,
+                              random_samples = F,
+                              window_w = opt_granularity,
+                              window_h = opt_granularity)
+  
+  stats_final_sample = get_spatialstats_sample(sample_set = final_sample,
+                                            uniformity_method = uniformity_method,
+                                            signif=signif,
+                                            robustness_method = robustness_method)
+  
+  tmp = matrix(data=stats_final_sample$samples_covar,nrow=nrow(map$counts),ncol=ncol(map$counts))
+  map$covar = raster::flip(raster(tmp),direction=2)
+  map$covar = setExtent(map$covar,extent(map$counts))
+  
+  tmp = matrix(data=stats_final_sample$samples_csr_pass,nrow=nrow(map$counts),ncol=ncol(map$counts))
+  map$is.csr = !(raster::flip(raster(tmp),direction=2))
+  map$is.csr = setExtent(map$is.csr,extent(map$counts))
+  
+  robust = my_spatialstats$robustness
+  unif = my_spatialstats$uniformity
+  
+  map$uniformity.curve = unif
+  map$granularities.tested = my_scales
   #map$unif.score = 
-  #map$robust.score =
+  map$robustness.curve =robust
   #map$unit.size = 
   return(map)
 }
@@ -104,8 +130,15 @@ get_spatialstats_all<-function(point_set,
                                random_samples=T,
                                nsamples=500,
                                signif=0.90,
-                               robustness=c("Poisson","Binomial","Resampling"),
-                               uniformity=c("Quadratcount","Nearest-neighbor")){
+                               robustness_method=c("Poisson","Binomial","Resampling"),
+                               robustness_k = -3,
+                               uniformity_method=c("Quadratcount","Nearest-neighbor"),
+                               verbose=verbose){
+  
+  if(robustness_k >= 0) {
+    print("robust_k parameter must be less than zero. See documentation for details.")
+    return(NULL)
+  }
   
   len_scales = min(c(length(scales_lon),length(scales_lat)))
   total_points = nrow(point_set)
@@ -126,7 +159,7 @@ get_spatialstats_all<-function(point_set,
   scales_zeros = vector(length=len_scales)
   
   for(i in 1:len_scales) {
-    print(paste(100*(i/len_scales),"%"))
+    if(verbose) print(paste(100*(i/len_scales),"%"))
     
     # generating set of quadrats of the current granularity for taking the samples
     my_samples = create_samples(point_set=point_set,
@@ -137,8 +170,8 @@ get_spatialstats_all<-function(point_set,
     
     my_stats_sample = get_spatialstats_sample(sample_set = my_samples,
                                               signif = signif,
-                                              uniformity = uniformity,
-                                              robustness = robustness)
+                                              uniformity_method = uniformity_method,
+                                              robustness_method = robustness_method)
     
     # avg number of points per sample (and var)
     scales_count[i] = mean(my_stats_sample$samples_count[!is.na(my_stats_sample$samples_count)])
@@ -155,12 +188,16 @@ get_spatialstats_all<-function(point_set,
     # number of zeros
     scales_zeros[i] = my_stats_sample$samples_zeros/my_samples$nsample
   }
+  
+  scales_robustness = exp(-3*scales_covar)
+  scales_uniformity = 1-scales_csr_pass
+  
   out = list(count = scales_count,
                   var = scales_var,
-                  csr_p = scales_csr_p,
-                  csr_median_p = scales_csr_median_p,
-                  csr_pass = scales_csr_pass,
-                  covar = scales_covar,
+                  #csr_p = scales_csr_p,
+                  #csr_median_p = scales_csr_median_p,
+                  uniformity = scales_uniformity,
+                  robustness = scales_robustness,
                   zerors = scales_zeros
   )
   return(out)
@@ -180,7 +217,7 @@ create_samples<-function(point_set,random_samples,nsamples,window_w,window_h) {
     offset_lat = ((h_b-window_h)*runif(nsamples))+min_b_lat
   }
   else {
-    # contiguous quadratas
+    # contiguous quadrats
     nlon = floor(w_b/window_w)
     nlat = floor(h_b/window_h)
     nsamples = nlon*nlat
@@ -206,8 +243,8 @@ create_samples<-function(point_set,random_samples,nsamples,window_w,window_h) {
 
 get_spatialstats_sample<-function(sample_set,
                                   signif,
-                                  robustness=c("Poisson","Binomial","Resampling"),
-                                  uniformity=c("Quadratcount","Nearest-neighbor")){
+                                  robustness_method=c("Poisson","Binomial","Resampling"),
+                                  uniformity_method=c("Quadratcount","Nearest-neighbor")){
   
   nsamples = length(sample_set$offset_lon)
   
@@ -220,7 +257,7 @@ get_spatialstats_sample<-function(sample_set,
   
   # for each quadrat, take a the points inside and test for robustness and internal uniformity
   for(j in 1:nsamples) {
-    #print(j)
+    
     # extracting the points inside the quadrat
     W_ext = c(sample_set$offset_lon[j],
               sample_set$offset_lon[j]+sample_set$window_w,
@@ -253,7 +290,7 @@ get_spatialstats_sample<-function(sample_set,
       # testing Complete Spatial Randomness (CSR) with Clark-Evans nearest neighbor test (part of estimating uniformity)
       samples_count[j] = nrow(sub_points)
       
-      if(uniformity == "Nearest-neighbor") {
+      if(uniformity_method == "Nearest-neighbor") {
         if(samples_count[j] > 20) {
           my_clarkevans = clarkevans.test(as.ppp(sub_points,W_disp),alternative="two.sided")#,correction = "Donnelly")
         } else {
@@ -263,7 +300,7 @@ get_spatialstats_sample<-function(sample_set,
         # assign T to quadrats that pass the threshold 'signif' for CSR
         samples_csr_pass[j] =  my_clarkevans$p.value < (1-signif)
       }
-      else if(uniformity == "Quadratcount") {
+      else if(uniformity_method == "Quadratcount") {
         # test CST with the quadrat test
         my_quadrattest = quadrat.test(as.ppp(sub_points,W_disp),nx=5)
         samples_csr_p[j] = my_quadrattest$p.value
@@ -274,7 +311,7 @@ get_spatialstats_sample<-function(sample_set,
         samples_csr_pass[j] = NA
       }
       
-      samples_covar[j] = calc_covar(nrow(sub_points),sample_set$npopulation,robustness)
+      samples_covar[j] = calc_covar(nrow(sub_points),sample_set$npopulation,robustness_method)
       # Calculating robustness.
       # First we calculate the expected coefficient of variation for the samples, using different methods
       #prob_event = nrow(sub_points)/sample_set$npopulation
@@ -305,20 +342,20 @@ get_spatialstats_sample<-function(sample_set,
 }
 
 
-calc_covar<-function(nsub,ntotal,robustness){
+calc_covar<-function(nsub,ntotal,robustness_method){
   # Calculating robustness.
   # First we calculate the expected coefficient of variation for the samples, using different methods
   prob_event = nsub/ntotal
-  if(robustness == "Binomial") {
+  if(robustness_method == "Binomial") {
     # calculating coef of var using the Binomial estimation method (see paper)
     samples_covar = sqrt(prob_event*(1-prob_event)*ntotal)/nsub#sd(sim_rates)/mean(sim_rates)
   }
-  else if(robustness == "Poisson") {
+  else if(robustness_method == "Poisson") {
     # calculating coef of var using the Poisson estimation method (see paper)
     tmp = fitdistr(nsub,"Poisson")
     samples_covar = tmp$sd/tmp$estimate
   }
-  else if(robustness == "Resampling") {
+  else if(robustness_method == "Resampling") {
     # calculating coef of var using the resampling estimation method (see paper)
     sim_rates = rbinom(1000,ntotal,prob_event)
     samples_covar = mean(sqrt(1/sim_rates[sim_rates!=0]))
